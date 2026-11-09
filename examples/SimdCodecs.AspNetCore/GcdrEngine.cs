@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using Sdcb.SimdGcdrNet;
 using Sdcb.SimdGcdrNet.Models;
 
-namespace ImageSharp.AspNetCore;
+namespace SimdCodecs.AspNetCore;
 
 /// <summary>One thread-safe <see cref="GcdrEnhancer"/> per backend, created on first use.</summary>
 public sealed class GcdrEngine : IDisposable

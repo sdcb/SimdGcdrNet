@@ -90,7 +90,7 @@ matching the reference Python implementation.
 
 The three UI examples open `examples/example.jpg` (a phone photo of a hand-drawn poster with a hard hand shadow):
 
-- `examples/ImageSharp.AspNetCore` — ASP.NET Core + ImageSharp (`Rgba32`, in place): upload / drag-and-drop,
+- `examples/SimdCodecs.AspNetCore` — ASP.NET Core + SimdCodecs (`ImageCodecs.Decode` with `ApplyOrientation` into one `Rgba32` buffer, enhanced in place; a bad upload returns the codec's own error message): upload / drag-and-drop,
   before-after slider, `auto` / `cpu` backend switch, timings; `POST /api/enhance` returns the enhanced image
   (API docs at `/scalar`).
 - `examples/SkiaSharp.Avalonia` — cross-platform desktop (Windows / Linux / macOS, `Bgra32` `SKBitmap`):
@@ -102,7 +102,7 @@ The three UI examples open `examples/example.jpg` (a phone photo of a hand-drawn
   original returns 56 lines (mostly garbage from the back side), on the enhanced image the 14 real lines.
 
 ```bash
-dotnet run --project examples/ImageSharp.AspNetCore        # http://localhost:5190
+dotnet run --project examples/SimdCodecs.AspNetCore        # http://localhost:5190
 dotnet run --project examples/SkiaSharp.Avalonia -- [image]
 dotnet run --project examples/OpenCvSharp5.Wpf -- [image]
 dotnet run --project examples/PaddleOCR.Console -- [image] [output.jpg]
@@ -279,7 +279,7 @@ enh.Enhance(src, w, h, srcStride, dst, dstStride, GcdrPixelFormat.Rgba32);
 
 三个界面示例默认打开 `examples/example.jpg`（手机拍摄的手抄报，带一块很硬的手影）：
 
-- `examples/ImageSharp.AspNetCore`：ASP.NET Core + ImageSharp（`Rgba32` 原地增强），上传/拖拽图片、前后对比滑块、
+- `examples/SimdCodecs.AspNetCore`：ASP.NET Core + SimdCodecs（`ImageCodecs.Decode` 加 `ApplyOrientation` 解码到一块 `Rgba32` 缓冲区并原地增强；上传文件有问题时直接返回解码器给出的错误原因），上传/拖拽图片、前后对比滑块、
   `auto` / `cpu` 后端切换与耗时；`POST /api/enhance` 直接返回增强后的图片，API 文档在 `/scalar`。
 - `examples/SkiaSharp.Avalonia`：跨平台桌面（Windows / Linux / macOS，`Bgra32` 的 `SKBitmap`），左右对比预览，
   可切换 `auto` / `cpu` / `vulkan`（macOS 上为 `metal`），结果可存为 JPEG / PNG。
@@ -289,7 +289,7 @@ enh.Enhance(src, w, h, srcStride, dst, dstStride, GcdrPixelFormat.Rgba32);
   背面透字严重：原图 OCR 出 56 行（大部分是背面透过来的乱码），增强后只剩正文的 14 行。
 
 ```bash
-dotnet run --project examples/ImageSharp.AspNetCore        # http://localhost:5190
+dotnet run --project examples/SimdCodecs.AspNetCore        # http://localhost:5190
 dotnet run --project examples/SkiaSharp.Avalonia -- [图片]
 dotnet run --project examples/OpenCvSharp5.Wpf -- [图片]
 dotnet run --project examples/PaddleOCR.Console -- [图片] [输出.jpg]

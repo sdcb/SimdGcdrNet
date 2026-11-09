@@ -1,21 +1,15 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
-using System.Runtime.InteropServices;
-using ImageSharp.AspNetCore;
+using SimdCodecs.AspNetCore;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using Scalar.AspNetCore;
 using Sdcb.SimdGcdrNet;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.Formats.Bmp;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.Formats.Jpeg;
-using SixLabors.ImageSharp.Formats.Png;
-using SixLabors.ImageSharp.Formats.Webp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using Sdcb.SimdCodecs;
+using Sdcb.SimdCodecs.Abstractions;
+using Sdcb.SimdCodecs.Jpeg;
+using Sdcb.SimdCodecs.Webp;
 
 const long maxUploadBytes = 20 * 1024 * 1024;
 string[] timingHeaders = ["X-Decode-Ms", "X-Enhance-Ms", "X-Encode-Ms", "X-Image-Size", "X-Backend"];
@@ -79,63 +73,54 @@ static async Task<IResult> EnhanceAsync(
         return Results.BadRequest(new EnhanceError("图片超过 20 MB 上限。"));
     if (!GcdrEngine.TryParseBackend(upload.Backend, out GcdrBackend backend))
         return Results.BadRequest(new EnhanceError("backend 必须是 auto 或 cpu。"));
-    if (!TryGetEncoder(upload.Format,     out IImageEncoder encoder, out string contentType))
+    if (!TryGetEncoder(upload.Format, out ImageFormat format, out EncodeOptions? encodeOptions, out string contentType))
         return Results.BadRequest(new EnhanceError("format 必须是 jpeg、webp 或 png。"));
 
     Stopwatch stage = Stopwatch.StartNew();
     try
     {
-        await using Stream stream = file.OpenReadStream();
-        using Image<Rgba32> image = await Image.LoadAsync<Rgba32>(GcdrImageDecode.Options, stream, cancellationToken);
-        if ((long)image.Width * image.Height > GcdrEngine.MaxImagePixels)
+        // The facade decodes from memory: read the upload (at most 20 MB) into one array.
+        byte[] data = new byte[file.Length];
+        await using (Stream stream = file.OpenReadStream())
+            await stream.ReadExactlyAsync(data, cancellationToken);
+
+        // The header gives the size, so an oversized image is refused before any pixel is allocated.
+        // A file whose header cannot be read goes on to Decode, which throws with the codec's reason.
+        if (ImageCodecs.TryReadInfo(data, out ImageInfo info) && (long)info.Width * info.Height > GcdrEngine.MaxImagePixels)
             return Results.BadRequest(new EnhanceError("图片像素超过上限（1600 万）。"));
-        // Phone photos usually carry an EXIF rotation; bake it in so the output looks like the input.
-        image.Mutate(x => x.AutoOrient());
+
+        // Phone photos usually carry an EXIF rotation: ApplyOrientation bakes it in and resets the tag in Metadata.
+        // Metadata (ICC profile, Exif) is passed on to the encoder.
+        using PixelBuffer buffer = ImageCodecs.Decode(data, PixelFormat.Rgba32,
+            new DecodeOptions { ApplyOrientation = true }, cancellationToken);
+        int width = buffer.Width, height = buffer.Height, stride = buffer.Stride;
         double decodeMs = stage.Elapsed.TotalMilliseconds;
 
         stage.Restart();
         GcdrEnhancer enhancer = engine.Get(backend);
-        int stride = image.Width * 4;
-        if (image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory))
-        {
-            // In place: src and dst are the same RGBA buffer with the same stride.
-            Span<byte> pixels = MemoryMarshal.AsBytes(memory.Span);
-            enhancer.Enhance(pixels, image.Width, image.Height, stride, pixels, stride, GcdrPixelFormat.Rgba32);
-        }
-        else
-        {
-            Rgba32[] packed = new Rgba32[checked(image.Width * image.Height)];
-            image.CopyPixelDataTo(packed);
-            Span<byte> pixels = MemoryMarshal.AsBytes(packed.AsSpan());
-            enhancer.Enhance(pixels, image.Width, image.Height, stride, pixels, stride, GcdrPixelFormat.Rgba32);
-            image.Frames.RootFrame.ProcessPixelRows(accessor =>
-            {
-                for (int y = 0; y < accessor.Height; y++)
-                    packed.AsSpan(y * accessor.Width, accessor.Width).CopyTo(accessor.GetRowSpan(y));
-            });
-        }
+        // In place: src and dst are the same RGBA buffer with the same stride.
+        enhancer.Enhance(buffer.Pixels, width, height, stride, buffer.WritablePixels, stride, GcdrPixelFormat.Rgba32);
         double enhanceMs = stage.Elapsed.TotalMilliseconds;
 
         stage.Restart();
-        MemoryStream output = new();
-        await image.SaveAsync(output, encoder, cancellationToken);
+        using MemoryStream output = new();
+        ImageCodecs.Encode(buffer.Pixels, width, height, PixelFormat.Rgba32, format, output, stride, encodeOptions, buffer.Metadata, cancellationToken);
         double encodeMs = stage.Elapsed.TotalMilliseconds;
-        output.Position = 0;
 
         response.Headers["X-Decode-Ms"] = FormatMs(decodeMs);
         response.Headers["X-Enhance-Ms"] = FormatMs(enhanceMs);
         response.Headers["X-Encode-Ms"] = FormatMs(encodeMs);
-        response.Headers["X-Image-Size"] = $"{image.Width}x{image.Height}";
+        response.Headers["X-Image-Size"] = $"{width}x{height}";
         response.Headers["X-Backend"] = backend.ToString().ToLowerInvariant();
-        return Results.Stream(output, contentType);
+        return Results.File(output.ToArray(), contentType);
     }
-    catch (UnknownImageFormatException)
+    catch (NotSupportedException ex)
     {
-        return Results.BadRequest(new EnhanceError("无法解析图片，请上传 JPEG、PNG、WebP、BMP 或 GIF。"));
+        return Results.BadRequest(new EnhanceError(ex.Message));
     }
-    catch (InvalidImageContentException ex)
+    catch (InvalidDataException ex)
     {
-        return Results.BadRequest(new EnhanceError($"图片内容无效：{ex.Message}"));
+        return Results.BadRequest(new EnhanceError(ex.Message));
     }
     catch (Exception ex)
     {
@@ -143,16 +128,16 @@ static async Task<IResult> EnhanceAsync(
     }
 }
 
-static bool TryGetEncoder(string? format, out IImageEncoder encoder, out string contentType)
+static bool TryGetEncoder(string? format, out ImageFormat imageFormat, out EncodeOptions? options, out string contentType)
 {
-    (encoder, contentType) = (string.IsNullOrWhiteSpace(format) ? "jpeg" : format.Trim().ToLowerInvariant()) switch
+    (imageFormat, options, contentType) = (string.IsNullOrWhiteSpace(format) ? "jpeg" : format.Trim().ToLowerInvariant()) switch
     {
-        "webp" => ((IImageEncoder)new WebpEncoder { FileFormat = WebpFileFormatType.Lossy, Quality = 90 }, "image/webp"),
-        "jpeg" or "jpg" => (new JpegEncoder { Quality = 90 }, "image/jpeg"),
-        "png" => (new PngEncoder(), "image/png"),
-        _ => (null!, ""),
+        "webp" => (ImageFormat.Webp, (EncodeOptions?)new WebpLossyEncodeOptions { Quality = 90 }, "image/webp"),
+        "jpeg" or "jpg" => (ImageFormat.Jpeg, new JpegEncodeOptions { Quality = 90 }, "image/jpeg"),
+        "png" => (ImageFormat.Png, (EncodeOptions?)null, "image/png"),
+        _ => (ImageFormat.Unknown, null, ""),
     };
-    return encoder is not null;
+    return imageFormat != ImageFormat.Unknown;
 }
 
 static string FormatMs(double ms) => ms.ToString("0.0", CultureInfo.InvariantCulture);
@@ -171,25 +156,3 @@ internal sealed class EnhanceUpload
 internal sealed record BackendList(string[] Backends, string Default);
 
 internal sealed record EnhanceError(string Error);
-
-// Only the formats this demo needs: no TIFF decoder, which is where most ImageSharp 3.1.x advisories live.
-// A new Configuration (not Configuration.Default) so the global defaults stay untouched.
-file static class GcdrImageDecode
-{
-    public static readonly DecoderOptions Options = CreateOptions();
-
-    static DecoderOptions CreateOptions()
-    {
-        Configuration configuration = new(
-            new JpegConfigurationModule(),
-            new PngConfigurationModule(),
-            new WebpConfigurationModule(),
-            new BmpConfigurationModule(),
-            new GifConfigurationModule())
-        {
-            // The default allocator splits pixels into 4 MB chunks; ask for one buffer so Enhance can run in place.
-            PreferContiguousImageBuffers = true,
-        };
-        return new DecoderOptions { Configuration = configuration };
-    }
-}

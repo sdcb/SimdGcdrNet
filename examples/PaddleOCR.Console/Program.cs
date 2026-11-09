@@ -1,45 +1,47 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Sdcb.SimdGcdrNet;
 using Sdcb.SimdGcdrNet.Models;
 using Sdcb.SimdPaddleOCR;
 using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using Sdcb.SimdCodecs;
+using Sdcb.SimdCodecs.Abstractions;
+using Sdcb.SimdCodecs.Webp;
 
 // usage: PaddleOCR.Console [image] [output]
 // Cleans a photographed page with SimdGcdrNet (shadows, uneven lighting, show-through from the
 // back side), then runs SimdPaddleOCR on the original and the enhanced image. The default
 // ocr-example.jpg has heavy show-through, which OCR reads as garbage lines on the original.
-// Both libraries take raw interleaved pixels, so the decoded RGBA buffer is shared without re-encoding.
+// Both libraries take raw interleaved pixels, so SimdCodecs decodes straight into one RGBA array they share.
 string input = args.Length > 0 ? args[0] : Path.Combine(AppContext.BaseDirectory, "ocr-example.jpg");
 string output = args.Length > 1 ? args[1] : Path.ChangeExtension(Path.GetFileName(input), null) + "-enhanced.jpg";
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-DecoderOptions decoderOptions = new() { Configuration = Configuration.Default.Clone() };
-// One contiguous pixel buffer, so both libraries can read it as a single span.
-decoderOptions.Configuration.PreferContiguousImageBuffers = true;
-
-using Image<Rgba32> original = Image.Load<Rgba32>(decoderOptions, input);
-original.Mutate(x => x.AutoOrient());
-using Image<Rgba32> enhanced = original.Clone();
-int width = original.Width, height = original.Height, stride = width * 4;
+// ApplyOrientation bakes the EXIF rotation in; Decode throws with the codec's reason when the file is bad.
+using PixelBuffer decoded = ImageCodecs.Decode(File.ReadAllBytes(input), PixelFormat.Rgba32, new DecodeOptions { ApplyOrientation = true });
+int width = decoded.Width, height = decoded.Height;
+byte[] original = decoded.Pixels.ToArray(); // a span cannot live across the await below
+byte[] enhanced = (byte[])original.Clone();
+int stride = width * 4;
 Console.WriteLine($"{input}: {width}x{height}");
 
 using GcdrEnhancer enhancer = GcdrEnhancer.FromBytes(GcdrModels.GcNet, GcdrModels.DrNet, GcdrBackend.Auto);
 using PaddleOcrAll ocr = await PaddleOcrAll.LoadAsync(ChineseV6TinyModels.Default);
 
 Stopwatch sw = Stopwatch.StartNew();
-Span<byte> pixels = Pixels(enhanced);
-enhancer.Enhance(pixels, width, height, stride, pixels, stride, GcdrPixelFormat.Rgba32);
+enhancer.Enhance(enhanced, width, height, stride, enhanced, stride, GcdrPixelFormat.Rgba32);
 Console.WriteLine($"enhanced in {sw.ElapsedMilliseconds} ms (first call includes plan compilation)");
-enhanced.Save(output);
+ImageFormat outputFormat = Path.GetExtension(output).ToLowerInvariant() switch
+{
+    ".png" => ImageFormat.Png,
+    ".webp" => ImageFormat.Webp,
+    _ => ImageFormat.Jpeg,
+};
+using (FileStream fs = File.Create(output))
+    ImageCodecs.Encode(enhanced, width, height, PixelFormat.Rgba32, outputFormat, fs, stride, outputFormat == ImageFormat.Webp ? new WebpLossyEncodeOptions { Quality = 90 } : null, decoded.Metadata);
 Console.WriteLine($"saved {Path.GetFullPath(output)}");
 
-PaddleOcrResult before = ocr.Run(Pixels(original), width, height, stride, ImagePixelFormat.Rgba32);
-PaddleOcrResult after = ocr.Run(Pixels(enhanced), width, height, stride, ImagePixelFormat.Rgba32);
+PaddleOcrResult before = ocr.Run(original, width, height, stride, ImagePixelFormat.Rgba32);
+PaddleOcrResult after = ocr.Run(enhanced, width, height, stride, ImagePixelFormat.Rgba32);
 Print("original", before);
 Print("enhanced", after);
 
@@ -47,10 +49,6 @@ Console.WriteLine();
 Console.WriteLine($"{"",-10}{"lines",8}{"chars",8}");
 Summary("original", before);
 Summary("enhanced", after);
-
-static Span<byte> Pixels(Image<Rgba32> image) => image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> memory)
-    ? MemoryMarshal.AsBytes(memory.Span)
-    : throw new InvalidOperationException("pixel buffer is not contiguous");
 
 static void Print(string title, PaddleOcrResult result)
 {
