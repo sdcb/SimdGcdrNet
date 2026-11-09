@@ -8,3 +8,4 @@ vstest*.log
 build/nupkgs/
 build/nuget.exe
 tests/testdata/realdae/
+examples/PaddleOCR.Console/*-enhanced.*
