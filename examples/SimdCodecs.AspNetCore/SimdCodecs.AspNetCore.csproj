@@ -7,7 +7,7 @@
     <ProjectReference Include="..\..\src\Sdcb.SimdGcdrNet.Models\Sdcb.SimdGcdrNet.Models.csproj" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
     <PackageReference Include="Scalar.AspNetCore" Version="2.18.0" />
-    <PackageReference Include="Sdcb.SimdCodecs" Version="2.0.0-preview.20261109.2" />
+    <PackageReference Include="Sdcb.SimdCodecs" Version="2.0.0" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\example.jpg" Link="example.jpg" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

@@ -9,7 +9,7 @@
     <ProjectReference Include="..\..\src\Sdcb.SimdGcdrNet.Models\Sdcb.SimdGcdrNet.Models.csproj" />
     <PackageReference Include="Sdcb.SimdPaddleOCR" Version="2.0.0" />
     <PackageReference Include="Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny" Version="1.0.0" />
-    <PackageReference Include="Sdcb.SimdCodecs" Version="2.0.0-preview.20261109.2" />
+    <PackageReference Include="Sdcb.SimdCodecs" Version="2.0.0" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\ocr-example.jpg" Link="ocr-example.jpg" CopyToOutputDirectory="PreserveNewest" />
