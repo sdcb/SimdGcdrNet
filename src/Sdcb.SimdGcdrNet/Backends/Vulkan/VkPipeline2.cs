@@ -1,4 +1,3 @@
-using Sdcb.SimdGcdrNet.Extensions;
 using Sdcb.SimdOnnx.Backends.Vulkan;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Onnx;
@@ -47,9 +46,9 @@ internal sealed unsafe class VkGcdrPipeline : IDisposable
         _drModel = dr;
         _f16 = be.F16;
         string sfx = _f16 ? "_h" : "";
-        _pPre = _dev.GetPipeline("bgr2nhwc" + sfx, 2, 9 * 4, owner: GcdrExtensions.Owner);
-        _pDiv6 = _dev.GetPipeline("div6" + sfx, 3, 4, owner: GcdrExtensions.Owner);
-        _pPost = _dev.GetPipeline("nhwc2bgr" + sfx, 3, 9 * 4, owner: GcdrExtensions.Owner);
+        _pPre = _dev.GetPipeline("bgr2nhwc" + sfx, 2, 9 * 4, owner: GcdrShaders.Owner);
+        _pDiv6 = _dev.GetPipeline("div6" + sfx, 3, 4, owner: GcdrShaders.Owner);
+        _pPost = _dev.GetPipeline("nhwc2bgr" + sfx, 3, 9 * 4, owner: GcdrShaders.Owner);
         _cmdPool = _dev.NewCommandPool();
         try
         {
@@ -122,11 +121,11 @@ internal sealed unsafe class VkGcdrPipeline : IDisposable
         _recorded = true;
     }
 
-    /// <summary>Fused-pipeline graphs: physical I/O, the GcdrNet extension ops, and the staged
+    /// <summary>Fused-pipeline graphs: physical I/O and the staged
     /// tensor-core convs on SG16 (Intel Xe2) devices — twice as fast here as the direct family and
     /// stress-clean on this model (the OCR models are not; see CompileOptions.StagedCoopConv).</summary>
     private static CompileOptions GraphOptions { get; } =
-        VkBackend.PipeOptions with { Extensions = GcdrExtensions.Instance, StagedCoopConv = true };
+        VkBackend.PipeOptions with { StagedCoopConv = true };
 
     /// <summary>Per-worker device-arena budget (gc + dr). Within it the arena is grow-only
     /// (12.5% headroom on the first allocation, 25% on regrowth) so mixed sizes don't reallocate.

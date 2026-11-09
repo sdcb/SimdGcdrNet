@@ -1,5 +1,4 @@
 using Sdcb.SimdOnnx.Engine;
-using Sdcb.SimdGcdrNet.Extensions;
 using Sdcb.SimdOnnx.Onnx;
 using Xunit;
 

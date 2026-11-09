@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Sdcb.SimdOnnx.Engine;
-using Sdcb.SimdGcdrNet.Extensions;
 using Sdcb.SimdOnnx.Onnx;
 
 namespace Sdcb.SimdGcdrNet.Benchmark;
@@ -45,7 +44,7 @@ public static partial class Program
             var m = OnnxModel.Load(mpath);
             int c = which == "gc" ? 3 : 6;
             // run the SAME (gpu-layout) plan on CPU and Metal so node indices align
-            var cpuPlan = GraphCompiler.Compile(m, [1, c, h, w], Sdcb.SimdOnnx.Backends.Metal.MetalBackend.PlanOptions with { Extensions = GcdrExtensions.Instance });
+            var cpuPlan = GraphCompiler.Compile(m, [1, c, h, w], Sdcb.SimdOnnx.Backends.Metal.MetalBackend.PlanOptions);
             using var cpu = new InferenceSession(cpuPlan);
             var rng = new Random(0);
             if (args.Length > 4)
@@ -58,8 +57,8 @@ public static partial class Program
             else
                 for (int i = 0; i < cpu.Input.Length; i++) cpu.Input[i] = rng.NextSingle();
             var mbe = Sdcb.SimdOnnx.Backends.Metal.MetalBackend.Default;
-            var mPlan = GraphCompiler.Compile(m, [1, c, h, w], Sdcb.SimdOnnx.Backends.Metal.MetalBackend.PlanOptions with { Extensions = GcdrExtensions.Instance });
-            using var mtl = mbe.NewSession(m, [1, c, h, w], GcdrExtensions.Instance);
+            var mPlan = GraphCompiler.Compile(m, [1, c, h, w], Sdcb.SimdOnnx.Backends.Metal.MetalBackend.PlanOptions);
+            using var mtl = mbe.NewSession(m, [1, c, h, w]);
             cpu.Input.CopyTo(mtl.Input);
             mtl.DebugUploadInput();
             if (Environment.GetEnvironmentVariable("MTRACE_NODES") == "1")
@@ -178,7 +177,7 @@ public static partial class Program
             // --node gc|dr h w idx reps : time one node in isolation (after a full warmup run)
             bool isDr = args[1] == "dr";
             int nh = int.Parse(args[2]), nw = int.Parse(args[3]), idx = int.Parse(args[4]), nreps = int.Parse(args[5]);
-            var cm = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(isDr ? drPath : gcPath), [1, isDr ? 6 : 3, nh, nw], CompileOptions.Default with { Extensions = GcdrExtensions.Instance }));
+            var cm = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(isDr ? drPath : gcPath), [1, isDr ? 6 : 3, nh, nw], CompileOptions.Default));
             var ss = cm.CreateSession();
             new Random(0).NextBytes(MemoryMarshal.AsBytes(ss.Input));
             if (args.Length > 6 && args[6] == "u") { var rr = new Random(0); var inp = ss.Input; for (int i = 0; i < inp.Length; i++) inp[i] = rr.NextSingle(); }
@@ -203,8 +202,8 @@ public static partial class Program
             foreach ((string tag, string mp, int cin) in new[] { ("gc", gcPath, 3), ("dr", drPath, 6) })
             {
                 var m = OnnxModel.Load(mp);
-                var cpu = new CompiledModel(GraphCompiler.Compile(m, [1, cin, ch, cw], CompileOptions.Default with { Extensions = GcdrExtensions.Instance })).CreateSession();
-                using var vk = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.NewSession(m, [1, cin, ch, cw], GcdrExtensions.Instance);
+                var cpu = new CompiledModel(GraphCompiler.Compile(m, [1, cin, ch, cw], CompileOptions.Default)).CreateSession();
+                using var vk = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.NewSession(m, [1, cin, ch, cw]);
                 var rng = new Random(7);
                 for (int i = 0; i < cpu.Input.Length; i++) cpu.Input[i] = vk.Input[i] = rng.NextSingle();
                 cpu.Run(); vk.Run();
@@ -228,14 +227,14 @@ public static partial class Program
             int nh = args.Length > 2 ? int.Parse(args[2]) : 128, nw = args.Length > 3 ? int.Parse(args[3]) : 192;
             var m = OnnxModel.Load(isDr ? drPath : gcPath);
             int[] shape = [1, isDr ? 6 : 3, nh, nw];
-            var plan = GraphCompiler.Compile(m, shape, Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.PlanOptions with { Extensions = GcdrExtensions.Instance });
+            var plan = GraphCompiler.Compile(m, shape, Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.PlanOptions);
             using var cpu = new InferenceSession(plan);
-            using var gpu = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.NewSession(m, shape, GcdrExtensions.Instance);
+            using var gpu = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.NewSession(m, shape);
             var rng = new Random(7);
             for (int i = 0; i < cpu.Input.Length; i++) cpu.Input[i] = gpu.Input[i] = rng.NextSingle();
             gpu.DebugUploadInput();
-            var ranges = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.GraphFor(m, shape, ext: GcdrExtensions.Instance).NodeRanges;
-            var gd = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.GraphFor(m, shape, ext: GcdrExtensions.Instance).Dispatches;
+            var ranges = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.GraphFor(m, shape).NodeRanges;
+            var gd = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default.GraphFor(m, shape).Dispatches;
             for (int i = 0; i < plan.Nodes.Length; i++)
             {
                 var nd = plan.Nodes[i];
@@ -309,7 +308,7 @@ public static partial class Program
             foreach ((string tag, string mp, int cin) in new[] { ("gc", gcPath, 3), ("dr", drPath, 6) })
             {
                 var m = OnnxModel.Load(mp);
-                using var s = be.NewSession(m, [1, cin, h, w], GcdrExtensions.Instance);
+                using var s = be.NewSession(m, [1, cin, h, w]);
                 s.Run(); // warm
                 var agg = s.DebugProfile();
                 Console.WriteLine($"--- {tag} metal per-shader (total {agg.Values.Sum():F1} ms) ---");
@@ -400,7 +399,7 @@ public static partial class Program
         }
         for (int round = 0; round < 4; round++)
         {
-            using var s = be.NewSession(m, [1, c, h, w], GcdrExtensions.Instance);
+            using var s = be.NewSession(m, [1, c, h, w]);
             var rng = new Random(42);
             for (int i = 0; i < s.Input.Length; i++) s.Input[i] = rng.NextSingle();
             s.Run();
@@ -410,7 +409,7 @@ public static partial class Program
             // interleave: run smaller sessions to churn memory
             foreach (int cs in new[] { 1024, 1312, 1152 })
             {
-                using var s2 = be.NewSession(m, [1, c, cs, cs], GcdrExtensions.Instance);
+                using var s2 = be.NewSession(m, [1, c, cs, cs]);
                 new Random(0).NextBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(s2.Input));
                 s2.Run();
             }
@@ -424,7 +423,7 @@ public static partial class Program
     {
         foreach (var (path, c) in new[] { (gcPath, 3), (drPath, 6) })
         {
-            var plan = GraphCompiler.Compile(OnnxModel.Load(path), [1, c, h, w], CompileOptions.Default with { Extensions = GcdrExtensions.Instance });
+            var plan = GraphCompiler.Compile(OnnxModel.Load(path), [1, c, h, w], CompileOptions.Default);
             var written = new List<(long s, long e)>();
             bool Covered(long s, long e) =>
                 written.Any(r => r.s <= s && r.e >= e);
@@ -949,7 +948,7 @@ public static partial class Program
     {
         foreach (var (path, c) in new[] { (gcPath, 3), (drPath, 6) })
         {
-            var plan = GraphCompiler.Compile(OnnxModel.Load(path), [1, c, h, w], CompileOptions.Default with { Extensions = GcdrExtensions.Instance });
+            var plan = GraphCompiler.Compile(OnnxModel.Load(path), [1, c, h, w], CompileOptions.Default);
             long maxT = plan.Values.Max(v => v.Shape.Aggregate(1L, (a, x) => a * x));
             Console.WriteLine($"max tensor {maxT * 4 / 1048576.0:F0} MB, arena {plan.ArenaFloats * 4L / 1048576.0:F0} MB");
             using var s = new InferenceSession(plan);
@@ -973,8 +972,8 @@ public static partial class Program
 
     private static int Bench(string gcPath, string drPath, int h, int w, int reps)
     {
-        var gc = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(gcPath), [1, 3, h, w], CompileOptions.Default with { Extensions = GcdrExtensions.Instance }));
-        var dr = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(drPath), [1, 6, h, w], CompileOptions.Default with { Extensions = GcdrExtensions.Instance }));
+        var gc = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(gcPath), [1, 3, h, w], CompileOptions.Default));
+        var dr = new CompiledModel(GraphCompiler.Compile(OnnxModel.Load(drPath), [1, 6, h, w], CompileOptions.Default));
         var s1 = gc.CreateSession(); var s2 = dr.CreateSession();
         new Random(0).NextBytes(MemoryMarshal.AsBytes(s1.Input));
         new Random(1).NextBytes(MemoryMarshal.AsBytes(s2.Input));
@@ -1038,7 +1037,7 @@ public static partial class Program
         foreach ((string tag, string mp, int cin) in new[] { ("gc", gcPath, 3), ("dr", drPath, 6) })
         {
             var m = OnnxModel.Load(mp);
-            using var s = be.NewSession(m, [1, cin, h, w], GcdrExtensions.Instance);
+            using var s = be.NewSession(m, [1, cin, h, w]);
             s.Run(); // warm
             var agg = s.DebugProfile();
             double tot = agg.Values.Sum();

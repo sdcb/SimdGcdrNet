@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
-using Sdcb.SimdGcdrNet.Extensions;
 using Sdcb.SimdGcdrNet.Kernels;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Imaging;
@@ -103,7 +102,7 @@ public sealed class GcdrEnhancer : IDisposable
     // channels-last directly, so the plan has no boundary relayouts
     // the network sees B,G,R in [0, 1]
     private static readonly PixelNormalization s_unit = PixelNormalization.Unit();
-    private static readonly CompileOptions CpuPlan = new(CompileOptions.DefaultNhwc, PhysicalIo: true, Extensions: GcdrExtensions.Instance);
+    private static readonly CompileOptions CpuPlan = new(CompileOptions.DefaultNhwc, PhysicalIo: true);
     private static bool CpuNhwc => CpuPlan.Nhwc;
 
     private static long Key(int h, int w) => (long)h * 65536 + w;
@@ -307,7 +306,7 @@ public sealed class GcdrEnhancer : IDisposable
             // Apple7+ (M1+) for simdgroup matrix ops; Pipe() forces the embedded
             // MSL library compile now rather than mid-Enhance on macOS 13. Intel Macs can
             // claim Apple7 yet build the simdgroup-MMA conv with 0 threads/group (Pipe throws).
-            return dev.SupportsApple7 && dev.Pipe("bgr2nhwc", GcdrExtensions.Owner) is not null && dev.Pipe("conv_mm_32_0") is not null;
+            return dev.SupportsApple7 && dev.Pipe("bgr2nhwc", Backends.GcdrShaders.Owner) is not null && dev.Pipe("conv_mm_32_0") is not null;
         }
         catch { return false; }
     }

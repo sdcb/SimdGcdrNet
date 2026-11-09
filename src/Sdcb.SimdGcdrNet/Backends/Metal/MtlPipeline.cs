@@ -1,4 +1,3 @@
-using Sdcb.SimdGcdrNet.Extensions;
 using Sdcb.SimdOnnx.Backends.Metal;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Onnx;
@@ -58,9 +57,9 @@ internal sealed unsafe class MtlGcdrPipeline : IDisposable
         if (_gcG is null || h != _h || w != _w)
         {
             // a new size compiles two plans + graphs: build them side by side
-            var tg = Task.Run(() => _be.AcquireGraph(_gcModel, [1, 3, h, w], physIo: true, GcdrExtensions.Instance));
+            var tg = Task.Run(() => _be.AcquireGraph(_gcModel, [1, 3, h, w], physIo: true));
             MtlGraphModel gd;
-            try { gd = _be.AcquireGraph(_drModel, [1, 6, h, w], physIo: true, GcdrExtensions.Instance); }
+            try { gd = _be.AcquireGraph(_drModel, [1, 6, h, w], physIo: true); }
             catch { try { tg.GetAwaiter().GetResult().Release(); } catch { } throw; }
             MtlGraphModel gg;
             try { gg = tg.GetAwaiter().GetResult(); }
@@ -111,7 +110,7 @@ internal sealed unsafe class MtlGcdrPipeline : IDisposable
         uint h = (uint)_h, w = (uint)_w;
 
         // bgr2nhwc -> gc arena input
-        enc.SetPipeline(_dev.Pipe("bgr2nhwc", GcdrExtensions.Owner));
+        enc.SetPipeline(_dev.Pipe("bgr2nhwc", GcdrShaders.Owner));
         enc.SetBuffer(_bgrIn!, 0, 0);
         enc.SetBuffer(_arena!, _gcBase + InOff(gcPlan), 1);
         var pc = stackalloc uint[7] { h, w, (uint)_ih, (uint)_iw, (uint)_pt, (uint)_pl, (uint)srcStride };
@@ -123,7 +122,7 @@ internal sealed unsafe class MtlGcdrPipeline : IDisposable
 
         // div6: gc input + gc output -> dr arena input
         uint hw = h * w;
-        enc.SetPipeline(_dev.Pipe("div6", GcdrExtensions.Owner));
+        enc.SetPipeline(_dev.Pipe("div6", GcdrShaders.Owner));
         enc.SetBuffer(_arena!, _gcBase + InOff(gcPlan), 0);
         enc.SetBuffer(_arena!, _gcBase + OutOff(gcPlan), 1);
         enc.SetBuffer(_arena!, InOff(drPlan), 2);
@@ -136,7 +135,7 @@ internal sealed unsafe class MtlGcdrPipeline : IDisposable
 
         // nhwc2bgr -> bgrOut
         uint nwords = ((uint)_ih * (uint)_iw * 3u + 3u) / 4u;
-        enc.SetPipeline(_dev.Pipe("nhwc2bgr", GcdrExtensions.Owner));
+        enc.SetPipeline(_dev.Pipe("nhwc2bgr", GcdrShaders.Owner));
         enc.SetBuffer(_arena!, OutOff(drPlan), 0);
         enc.SetBuffer(_bgrOut!, 0, 1);
         var pc3 = stackalloc uint[7] { h, w, (uint)_ih, (uint)_iw, (uint)_pt, (uint)_pl, nwords };
