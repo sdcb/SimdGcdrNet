@@ -25,8 +25,8 @@ The model is a two-stage pipeline:
 - **CPU backend** with ISA tiered dispatch: AVX-512 → AVX2 (+FMA, multithreaded) → `Vector<float>` → Scalar on x64;
   NEON (AArch64 AdvSimd) → Scalar on arm64; PackedSimd (WASM SIMD128) → `Vector<float>` → Scalar on browser-wasm.
 - **Vulkan compute backend** (Windows/Linux/Android `libvulkan`): push-descriptors, ReBAR-aware
-  staging, single-recorded-command-buffer graph execution, fused `bgr2nchw → GC → div6 → DR →
-  nchw2bgr` pipeline with arbitrary source/destination strides.
+  staging, single-recorded-command-buffer graph execution: pixels → GC → division → DR → pixels as one
+  model and one submit per image, with arbitrary source/destination strides.
 - **Metal compute backend** (macOS, Apple Silicon): pure C# ObjC P/Invoke (no Xamarin/Metal.NET),
   fp16 storage + fp32 math, simdgroup-MMA implicit-GEMM convolutions — see
   [docs/apple-m4-metal.md](https://github.com/sdcb/SimdGcdrNet/blob/main/docs/apple-m4-metal.md) (~7.5× CPU on M4).
@@ -113,18 +113,11 @@ dotnet run --project examples/PaddleOCR.Console -- [image] [output.jpg]
 The ONNX engine (protobuf reader, graph compiler, CPU SIMD kernels, Vulkan / Metal backends) is
 [Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx); this library holds the GCDRNet-specific parts:
 
-- `src/Sdcb.SimdGcdrNet/GcdrEnhancer.cs` — public API: backend selection, per-size session pools,
-  gc → dr stitching, arena stacking
-- `src/Sdcb.SimdGcdrNet/Extensions` — engine extensions (`GcdrExtensions`): fused operators
-  (`UpHeadOp`, `ChannelShiftOp`) with their CPU kernels (Vector / AVX-512 / NEON / WASM SIMD) and
-  graph passes
-- `src/Sdcb.SimdGcdrNet/Kernels` — `PixelOps` (glue between the two nets — division correction / concat — and the
-  Metal pipeline's BGR24 rows; pixels ↔ tensors go through `Sdcb.SimdOnnx.Imaging.ImageTensor`)
-- `src/Sdcb.SimdGcdrNet/Backends/Vulkan` — `VkPipeline2` (fused gc + dr pipeline on SimdOnnx's
-  Vulkan backend); `Shaders` holds the GCDRNet GLSL kernels, `tools/build-shaders.bat` recompiles
-  `.comp` → `.spv` (committed; dev-time only, not part of `dotnet build`)
-- `src/Sdcb.SimdGcdrNet/Backends/Metal` — `MtlPipeline` (fused pipeline on SimdOnnx's Metal
-  backend); `Shaders` holds MSL sources (embedded, compiled to PSOs at run time)
+- `src/Sdcb.SimdGcdrNet/GcdrEnhancer.cs` — public API: backend selection, session pools, and the
+  composed model (GC-Net → `clamp(x / max(shading, 1e-6), 0, 1)` → DR-Net, built with
+  `OnnxModelBuilder`) that runs on SimdOnnx's `CpuSession` and `VkImageSession` / `MtlImageSession`.
+  The library uses only SimdOnnx's public API; the fusions it needs (UpHead, ChannelShift, SafeDiv)
+  are engine built-ins.
 - `bench/Sdcb.SimdGcdrNet.Benchmark` — `--check`, `--bench` (CPU), `--benchvk` (Vulkan e2e),
   `--benchmtl` / `--checkgpu` / `--mtlprof` / `--mtrace` (Metal e2e, diff check, per-shader
   profile, CPU-vs-Metal per-node trace), `--vkprof` (per-shader/per-dispatch GPU timing), `--vkcheck` / `--vknodes`
@@ -217,7 +210,7 @@ IEEE TAI 2023）的**纯 C# 推理库**——不依赖 onnxruntime 等第三方�
 - **零推理引擎依赖**：自带 ONNX proto 读取 + 图编译（shape 特化、常量折叠、算子融合、arena 规划）
 - **CPU 后端**：x64 上 AVX-512 → AVX2+FMA 多线程 → `Vector<float>` → Scalar 四档 ISA 自动分发；arm64 上 NEON（AdvSimd）→ Scalar；browser-wasm 上 PackedSimd（WASM SIMD128）→ `Vector<float>` → Scalar
 - **Vulkan 后端**：push-descriptor、ReBAR 感知 staging、单命令缓冲图执行、
-  融合流水线（bgr2nchw→GC→div6→DR→nchw2bgr），支持任意 src/dst stride
+  像素 → GC → 除法校正 → DR → 像素合成一个模型、每张图一次提交，支持任意 src/dst stride
 - **Metal 后端**（macOS，Apple Silicon）：纯 C# ObjC P/Invoke（不依赖 Xamarin/Metal.NET），fp16 存储 + fp32 计算，
   simdgroup-MMA 隐式 GEMM 卷积，见 [docs/apple-m4-metal.md](https://github.com/sdcb/SimdGcdrNet/blob/main/docs/apple-m4-metal.md)（M4 上约为 CPU 的 7.5 倍）
 - **任意 8 位交错像素格式**（`Bgr24` / `Rgb24` / `Bgra32` / `Rgba32`），任意 stride，支持原地增强；
@@ -297,8 +290,8 @@ dotnet run --project examples/PaddleOCR.Console -- [图片] [输出.jpg]
 
 ### 构建 shader
 
-`src/Sdcb.SimdGcdrNet/Backends/Vulkan/Shaders/*.spv` 已随源码提交（嵌入资源）；
-改动 `.comp` 后运行 `tools/build-shaders.bat`（需要 glslc / Vulkan SDK）重新生成。
+本库不再自带 shader：所有 GPU 内核（包括 UpHead / ChannelShift 融合和像素 I/O）都在
+[Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx) 里。
 
 ### 测试
 

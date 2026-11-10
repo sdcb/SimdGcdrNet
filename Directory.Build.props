@@ -6,9 +6,10 @@
   <PropertyGroup>
     <SdcbSimdGcdrNetVersion Condition="'$(SdcbSimdGcdrNetVersion)' == ''">2.0.0</SdcbSimdGcdrNetVersion>
     <SdcbSimdGcdrNetModelsVersion Condition="'$(SdcbSimdGcdrNetModelsVersion)' == ''">1.0.0</SdcbSimdGcdrNetModelsVersion>
-    <!-- Engine package (exact pin: the library builds against engine internals). UseLocalSimdOnnx=true
-         switches to ../Sdcb.SimdOnnx as a project reference for side-by-side development. -->
-    <SdcbSimdOnnxVersion Condition="'$(SdcbSimdOnnxVersion)' == ''">0.1.0-preview.6</SdcbSimdOnnxVersion>
+    <!-- Engine package. The library uses only its public API, but the engine is a preview whose API
+         still moves, so the pin stays exact. UseLocalSimdOnnx=true switches to ../Sdcb.SimdOnnx as a
+         project reference for side-by-side development. -->
+    <SdcbSimdOnnxVersion Condition="'$(SdcbSimdOnnxVersion)' == ''">0.1.0-preview.9</SdcbSimdOnnxVersion>
     <SimdOnnxProject Condition="'$(SimdOnnxProject)' == ''">$(MSBuildThisFileDirectory)..\Sdcb.SimdOnnx\src\Sdcb.SimdOnnx\Sdcb.SimdOnnx.csproj</SimdOnnxProject>
     <!-- a stable package pinned to an engine preview (NU5104): accepted while the engine is a preview on
          the ProGet test feed; a nuget.org release of this package needs the engine released first -->
