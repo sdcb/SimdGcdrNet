@@ -5,12 +5,6 @@
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
   <ItemGroup>
-    <!-- SPIR-V binaries are committed next to the .comp sources; regenerate with
-         src/Sdcb.SimdGcdrNet/Backends/Vulkan/tools/build-shaders.bat (glslc, dev-time only). -->
-    <EmbeddedResource Include="Backends\Vulkan\Shaders\*.spv" />
-    <EmbeddedResource Include="Backends\Metal\Shaders\*.metal" />
-    <None Remove="Backends\Vulkan\Shaders\*.comp" />
-    <None Remove="Backends\Vulkan\Shaders\*.spv" />
     <!-- LINQPad picks these up from packages tagged linqpad-samples -->
     <None Include="linqpad-samples\*.linq" Pack="true" PackagePath="linqpad-samples" />
   </ItemGroup>
