@@ -1,5 +1,4 @@
 using Sdcb.SimdOnnx.Backends.Metal;
-using Sdcb.SimdGcdrNet.Backends.Metal;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Onnx;
 using Xunit;

@@ -1,5 +1,4 @@
 using Sdcb.SimdOnnx.Backends.Vulkan;
-using Sdcb.SimdGcdrNet.Backends.Vulkan;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Onnx;
 using Xunit;

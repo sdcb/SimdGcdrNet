@@ -1,6 +1,5 @@
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Kernels;
-using Sdcb.SimdGcdrNet.Kernels;
 using Sdcb.SimdOnnx.Onnx;
 using Xunit;
 
@@ -18,23 +17,17 @@ public class EngineTests
     [InlineData("mid")]
     public void DivConcat_MatchesOracle_Float(string tag)
     {
-        // stage-2 math verified at float precision, not just through u8 output:
-        // our GC session on the oracle input -> our own div+concat -> oracle dr_in
+        // stage-2 math verified at float precision, not just through u8 output: the composed
+        // model (GC-Net + glue) cut at the DR-Net input, on the oracle input, vs the oracle dr_in
         float[] x = Golden.F32(tag, "input");
         int[] shape = Golden.ShapeOf(tag, "input");
         float[] expect = Golden.F32(tag, "dr_in");
 
-        OnnxModel m = OnnxModel.Load(GcPath);
-        CompiledModel cm = CompiledModel.Compile(m, shape);
-        using var sess = cm.CreateSession();
+        OnnxModel m = GcdrEnhancer.Compose(OnnxModel.Load(GcPath), OnnxModel.Load(DrPath));
+        using var sess = new CpuSession(new CpuModel(m).WithOutput(GcdrEnhancer.DrInput));
+        sess.Reshape(shape);
         x.CopyTo(sess.Input);
-        sess.Run();
-        float[] shadow = sess.Output.ToArray();
-
-        int hw = shape[2] * shape[3];
-        float[] drIn = new float[6 * hw];
-        Array.Copy(x, drIn, 3 * hw);
-        Kernels.PixelOps.DivClampInto(x, shadow, drIn.AsSpan(3 * hw));
+        float[] drIn = sess.Run().ToArray();
 
         var (max, rmse, _) = Golden.Diff(drIn, expect);
         Assert.True(max < 1e-3f, $"dr_in[{tag}] max diff {max} rmse {rmse}");

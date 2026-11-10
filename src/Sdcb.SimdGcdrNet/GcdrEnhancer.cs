@@ -1,13 +1,13 @@
 using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
-using Sdcb.SimdGcdrNet.Kernels;
 using Sdcb.SimdOnnx.Engine;
 using Sdcb.SimdOnnx.Imaging;
 using Sdcb.SimdOnnx.Kernels;
 using Sdcb.SimdOnnx.Onnx;
+using MetalBackend = Sdcb.SimdOnnx.Backends.Metal.MetalBackend;
+using MtlImageSession = Sdcb.SimdOnnx.Backends.Metal.MtlImageSession;
 using VkBackend = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend;
 using VkDeviceLostException = Sdcb.SimdOnnx.Backends.Vulkan.VkDeviceLostException;
-using MetalBackend = Sdcb.SimdOnnx.Backends.Metal.MetalBackend;
+using VkImageSession = Sdcb.SimdOnnx.Backends.Vulkan.VkImageSession;
 
 namespace Sdcb.SimdGcdrNet;
 
@@ -37,37 +37,47 @@ public sealed class GcdrEnhancer : IDisposable
     private readonly OnnxModel _gcModel, _drModel;
     private readonly GcdrBackend _backend;
 
-    // CPU: per-size plans are managed metadata (cached, at most MaxSizes; packed
-    // weights shared across sizes through the kernel caches). Workers own grow-only
-    // native arenas (CpuArenaBudget, see CpuWorker) and serve every size; idle
-    // workers beyond the first are kept only while their arenas fit the budget.
+    // CPU: one model for both nets and the glue between them (Compose), so one plan per padded
+    // size (at most MaxSizes compiled; packed weights shared across sizes) and one arena per
+    // session. Sessions serve every size (grow-only arenas); idle ones beyond the first are kept
+    // only while their arenas fit the budget, and an over-budget one (a huge image) is dropped.
     private const int MaxSizes = 8, MaxPerSize = 4;
     private const long CpuArenaBudget = 4L << 30;
-    private readonly ConcurrentDictionary<long, (ExecPlan gc, ExecPlan dr)> _cpuPlans = new();
-    private readonly CpuKernels.Cache _gcKernels = new(), _drKernels = new();
+    private OnnxModel? _model;
+    private CpuModel? _cpuModel;
+    private readonly Dictionary<long, long> _cpuSizes = new();   // LRU mirror of the CpuModel's plan cache (PoolStats)
+    private long _cpuClock;
     // Cache Metal availability for the process: re-probing (incl. the MSL library
     // compile) per Enhance would re-throw on init failure for every frame.
     private static readonly Lazy<bool> s_metalOk = new(MetalOk);
 
     /// <summary>Whether the Metal backend can run here (what <see cref="GcdrBackend.Auto"/> checks).</summary>
     internal static bool MetalUsable => GpuPossible && s_metalOk.Value;
-    private SizePool<CpuWorker>? _cpuPool;
-    // Vulkan workers are size-agnostic (budgeted grow-only arenas, re-record on size
-    // change): one pool serves every size; idle workers beyond the first are kept
+    private SizePool<CpuSession>? _cpuPool;
+    // GPU image sessions are size-agnostic (budgeted grow-only arenas, re-record on size
+    // change): one pool serves every size; idle sessions beyond the first are kept
     // only while their device memory fits the budget
     // (3 GB; integrated GPUs: at most a quarter of the shared device-local heap)
-    private static long VkIdleBudget => (long)Backends.Vulkan.VkGcdrPipeline.BudgetFor(VkBackend.Default.Dev);
-    private SizePool<Backends.Vulkan.VkGcdrPipeline>? _vkPool;
-    private SizePool<Backends.Metal.MtlGcdrPipeline>? _mtlPool;
+    private static long VkIdleBudget
+    {
+        get
+        {
+            var d = VkBackend.Default.Device;
+            return d.UnifiedMemory && d.DeviceLocalBytes > 0 ? Math.Min(3L << 30, (long)(d.DeviceLocalBytes / 4)) : 3L << 30;
+        }
+    }
+    private const long MtlIdleBudget = 3L << 30;
+    private SizePool<VkImageSession>? _vkPool;
+    private SizePool<MtlImageSession>? _mtlPool;
     private long _poolsCreated, _workersCreated, _poolsEvicted;
 
     /// <summary>Diagnostics: CPU size plans compiled (Vulkan: worker pools created), worker
-    /// instances created, CPU size plans evicted.</summary>
+    /// instances (CPU sessions) created, CPU size plans evicted.</summary>
     public (long pools, long workers, long evicted) PoolStats =>
         (_poolsCreated, _workersCreated, _poolsEvicted);
 
-    /// <summary>Debug/test hook: invoked with the just-used vulkan pipeline after each Enhance.</summary>
-    internal Action<Backends.Vulkan.VkGcdrPipeline>? DebugAfterEnhance;
+    /// <summary>Debug/test hook: invoked with the just-used Vulkan session after each Enhance.</summary>
+    internal Action<VkImageSession>? DebugAfterEnhance;
 
     private GcdrEnhancer(OnnxModel gc, OnnxModel dr, GcdrBackend backend)
     {
@@ -98,76 +108,110 @@ public sealed class GcdrEnhancer : IDisposable
         return new(OnnxModel.Load(gcnetOnnx), OnnxModel.Load(drnetOnnx), backend);
     }
 
-    // pipeline sessions keep I/O in plan layout: the glue kernels below read/write
-    // channels-last directly, so the plan has no boundary relayouts
-    // the network sees B,G,R in [0, 1]
+    // the network sees B,G,R in [0, 1]; sessions keep I/O in plan layout (channels-last), so the
+    // plan has no boundary relayouts
     private static readonly PixelNormalization s_unit = PixelNormalization.Unit();
-    private static readonly CompileOptions CpuPlan = new(CompileOptions.DefaultNhwc, PhysicalIo: true);
+    // every run writes a fresh input, so the arena may reuse it once the glue has read it
+    private static readonly CompileOptions CpuPlan = new(CompileOptions.DefaultNhwc, PhysicalIo: true) { ReleaseInputs = true };
     private static bool CpuNhwc => CpuPlan.Nhwc;
 
-    private static long Key(int h, int w) => (long)h * 65536 + w;
+    /// <summary>
+    /// GC-Net → corrected = clamp(x / max(shading, 1e-6), 0, 1) → DR-Net on concat(x, corrected), as
+    /// one model over the [1, 3, h, w] input in [0, 1].
+    /// </summary>
+    /// <summary>The DR-Net input tensor of the composed model (tests cut the model there).</summary>
+    internal const string DrInput = "dr_in";
 
-    /// <summary>gc/dr plans for one padded size (compiled once, weights packed via the shared caches).</summary>
-    private (ExecPlan gc, ExecPlan dr) CpuPlans(int h, int w)
+    internal static OnnxModel Compose(OnnxModel gc, OnnxModel dr)
     {
-        long key = Key(h, w);
-        if (_cpuPlans.TryGetValue(key, out var p)) return p;
-        // the two nets compile independently: build them side by side
-        var tgc = Task.Run(() =>
-        {
-            ExecPlan g = GraphCompiler.Compile(_gcModel, [1, 3, h, w], CpuPlan);
-            CpuKernels.Pack(g, _gcKernels);
-            return g;
-        });
-        ExecPlan dr = GraphCompiler.Compile(_drModel, [1, 6, h, w], CpuPlan);
-        CpuKernels.Pack(dr, _drKernels);
-        ExecPlan gc = tgc.GetAwaiter().GetResult();
-        p = (gc, dr);
-        if (!_cpuPlans.TryAdd(key, p)) return _cpuPlans.TryGetValue(key, out var won) ? won : p;
-        Interlocked.Increment(ref _poolsCreated);
-        // bound the cache (plans are managed; in-flight users keep theirs alive)
-        while (_cpuPlans.Count > MaxSizes)
-        {
-            long victim = -1;
-            foreach (long k in _cpuPlans.Keys) if (k != key) { victim = k; break; }
-            if (victim < 0 || !_cpuPlans.TryRemove(victim, out _)) break;
-            Interlocked.Increment(ref _poolsEvicted);
-        }
-        return p;
+        var b = new OnnxModelBuilder(gc.Opset);
+        string x = b.Input("x", 1, 3, -1, -1);
+        string shade = b.Inline(gc, "gc/", x)[0];
+        string eps = b.Constant("eps", [1e-6f]), zero = b.Constant("zero", [0f]), one = b.Constant("one", [1f]);
+        string q = b.Node("Div", [x, b.Node("Clip", [shade, eps, ""])]);
+        string corrected = b.Node("Clip", [q, zero, one]);
+        string x6 = b.Node("Concat", [x, corrected], DrInput, ("axis", 1));
+        b.Output(b.Inline(dr, "dr/", x6)[0]);
+        return b.Build();
     }
 
-    private SizePool<CpuWorker> CpuPool()
+    /// <summary>The composed model (one instance: the backends cache graphs per model).</summary>
+    private OnnxModel Model()
+    {
+        if (_model is { } m) return m;
+        m = Compose(_gcModel, _drModel);
+        return Interlocked.CompareExchange(ref _model, m, null) ?? m;
+    }
+
+    private CpuModel CpuModel()
+    {
+        if (_cpuModel is { } m) return m;
+        m = new CpuModel(Model(), CpuPlan, MaxSizes);
+        return Interlocked.CompareExchange(ref _cpuModel, m, null) ?? m;
+    }
+
+    /// <summary>GPU pixel I/O: B,G,R in [0, 1], padded to a multiple of 32 at the top/left. The staged
+    /// tensor-core convs on SG16 (Intel Xe2) devices are twice as fast here as the direct family and
+    /// stress-clean on this model (the OCR models are not; see CompileOptions.StagedCoopConv).</summary>
+    private static readonly ImageSessionOptions s_vkImage = new()
+    {
+        PadMultiple = 32, Padding = ImagePadding.TopLeft,
+        Compile = VkBackend.PipeOptions with { StagedCoopConv = true, ReleaseInputs = true },
+    };
+    private static readonly ImageSessionOptions s_mtlImage = new()
+    {
+        PadMultiple = 32, Padding = ImagePadding.TopLeft,
+        Compile = MetalBackend.PipeOptions with { ReleaseInputs = true },
+    };
+
+    /// <summary>Counts a padded size the way the CPU model's LRU plan cache sees it.</summary>
+    private void NoteCpuSize(int h, int w)
+    {
+        long key = (long)h * 65536 + w;
+        lock (_cpuSizes)
+        {
+            bool added = !_cpuSizes.ContainsKey(key);
+            _cpuSizes[key] = ++_cpuClock;
+            if (!added) return;
+            _poolsCreated++;
+            if (_cpuSizes.Count <= MaxSizes) return;
+            long oldest = _cpuSizes.Where(kv => kv.Key != key).OrderBy(kv => kv.Value).First().Key;
+            _cpuSizes.Remove(oldest);
+            _poolsEvicted++;
+        }
+    }
+
+    private SizePool<CpuSession> CpuPool()
     {
         if (_cpuPool is { } p) return p;
-        p = new SizePool<CpuWorker>(MaxPerSize,
-            () => { Interlocked.Increment(ref _workersCreated); return new CpuWorker(); },
-            w => w.Bytes, CpuArenaBudget);
+        p = new SizePool<CpuSession>(MaxPerSize,
+            () => { Interlocked.Increment(ref _workersCreated); return new CpuSession(CpuModel()); },
+            w => w.ArenaBytes, CpuArenaBudget);
         if (Interlocked.CompareExchange(ref _cpuPool, p, null) is { } won) { p.Dispose(); return won; }
         return p;
     }
 
-    private SizePool<Backends.Vulkan.VkGcdrPipeline> VkPool()
+    private SizePool<VkImageSession> VkPool()
     {
         if (_vkPool is { } p) return p;
-        p = new SizePool<Backends.Vulkan.VkGcdrPipeline>(MaxPerSize,
-            () => { Interlocked.Increment(ref _workersCreated); return new Backends.Vulkan.VkGcdrPipeline(VkBackend.Default, _gcModel, _drModel); },
+        p = new SizePool<VkImageSession>(MaxPerSize,
+            () => { Interlocked.Increment(ref _workersCreated); return VkBackend.Default.CreateImageSession(Model(), s_vkImage); },
             w => w.DeviceBytes, VkIdleBudget);
         if (Interlocked.CompareExchange(ref _vkPool, p, null) is { } won) { p.Dispose(); return won; }
         Interlocked.Increment(ref _poolsCreated);
         return p;
     }
 
-    private SizePool<Backends.Metal.MtlGcdrPipeline> MtlPool()
+    private SizePool<MtlImageSession> MtlPool()
     {
         if (_mtlPool is { } p) return p;
-        p = new SizePool<Backends.Metal.MtlGcdrPipeline>(MaxPerSize,
-            () => { Interlocked.Increment(ref _workersCreated); return new Backends.Metal.MtlGcdrPipeline(MetalBackend.Default, _gcModel, _drModel); },
-            w => w.DeviceBytes, (long)Backends.Metal.MtlGcdrPipeline.ArenaBudget);
+        p = new SizePool<MtlImageSession>(MaxPerSize,
+            () => { Interlocked.Increment(ref _workersCreated); return MetalBackend.Default.CreateImageSession(Model(), s_mtlImage); },
+            w => w.DeviceBytes, MtlIdleBudget);
         if (Interlocked.CompareExchange(ref _mtlPool, p, null) is { } won) { p.Dispose(); return won; }
         Interlocked.Increment(ref _poolsCreated);
         return p;
     }
-
 
     /// <summary>
     /// Enhances an interleaved uint8 HWC image: reads <paramref name="src"/>
@@ -196,7 +240,7 @@ public sealed class GcdrEnhancer : IDisposable
         {
             var pool = MtlPool();
             var pipe = pool.Rent();
-            try { pipe.Enhance(src, height, width, srcStride, dst, dstStride, format); }
+            try { pipe.Run(src, width, height, srcStride, dst, dstStride, (PixelFormat)format); }
             finally { pool.Return(pipe); }
             return;
         }
@@ -210,7 +254,7 @@ public sealed class GcdrEnhancer : IDisposable
                 var pipe = pool.Rent();
                 try
                 {
-                    pipe.Enhance(src, height, width, srcStride, dst, dstStride, format);
+                    pipe.Run(src, width, height, srcStride, dst, dstStride, (PixelFormat)format);
                     DebugAfterEnhance?.Invoke(pipe);
                     return;
                 }
@@ -225,90 +269,68 @@ public sealed class GcdrEnhancer : IDisposable
         int ph = (-height) & 31, pw = (-width) & 31;
         int h = height + ph, w = width + pw;
 
-        var (gcPlan, drPlan) = CpuPlans(h, w);
         var cpuPool = CpuPool();
-        CpuWorker worker = cpuPool.Rent();
+        CpuSession session = cpuPool.Rent();
+        bool keep = true;
         try
         {
-            var (gcOff, total) = StackArenas(gcPlan, drPlan);
-            nint arena = worker.Arena(total * sizeof(float));
-            using var gc = new InferenceSession(gcPlan, arena + (nint)(gcOff * sizeof(float)));
-            using var dr = new InferenceSession(drPlan, arena);
-
-            // stage 0: fill GC input — BGR u8 → float /255, top/left replicate pad
-            Span<float> x = gc.Input;
-            TensorLayout layout = CpuNhwc ? TensorLayout.Nhwc : TensorLayout.Nchw;
-            ImageTensor.FromPixels(src, width, height, srcStride, (PixelFormat)format, x, layout, s_unit,
-                w, h, padLeft: pw, padTop: ph, threads: Avx2Kernels.Threads);
-
-            // stage 1: GC-Net → shading map
-            gc.Run();
-            ReadOnlySpan<float> shadow = gc.Output;
-            int[] oshape = gc.OutputShape;
+            session.Reshape([1, 3, h, w], session.Model);
+            NoteCpuSize(h, w);
+            int[] oshape = session.OutputShape();
             if (oshape[2] != h || oshape[3] != w)
-                throw new NotSupportedException($"GC-Net returned {oshape[2]}x{oshape[3]}, expected {h}x{w}.");
-
-            // stage 2: corrected = clamp(x / max(shadow,1e-6), 0,1); concat into DR input
-            Span<float> x6 = dr.Input;
-            int hw = h * w;
-            if (CpuNhwc) PixelOps.DivConcatNhwc(x, shadow, x6);
-            else
-            {
-                x.CopyTo(x6.Slice(0, 3 * hw));
-                PixelOps.DivClampInto(x, shadow, x6.Slice(3 * hw, 3 * hw));
-            }
-
-            // stage 3: DR-Net
-            dr.Run();
-
-            // stage 4: crop pad → u8 in the caller's format (alpha from src)
-            ImageTensor.ToPixels(dr.Output, layout, w, h, dst, width, height, dstStride, (PixelFormat)format,
+                throw new NotSupportedException($"The networks returned {oshape[2]}x{oshape[3]}, expected {h}x{w}.");
+            TensorLayout layout = CpuNhwc ? TensorLayout.Nhwc : TensorLayout.Nchw;
+            int threads = Environment.ProcessorCount;
+            // BGR u8 → float /255, top/left replicate pad
+            ImageTensor.FromPixels(src, width, height, srcStride, (PixelFormat)format, session.Input, layout, s_unit,
+                w, h, padLeft: pw, padTop: ph, threads: threads);
+            ReadOnlySpan<float> y = session.Run();
+            // crop the pad → u8 in the caller's format (alpha from src)
+            ImageTensor.ToPixels(y, layout, w, h, dst, width, height, dstStride, (PixelFormat)format,
                 cropLeft: pw, cropTop: ph, alphaSource: bpp == 4 ? src : default, alphaStride: srcStride,
-                threads: Avx2Kernels.Threads);
+                threads: threads);
+            // an arena past the budget (one huge image) is not kept for the sizes after it
+            keep = session.ArenaBytes <= CpuArenaBudget;
         }
-        finally { cpuPool.Return(worker); }
-    }
-
-    /// <summary>
-    /// One arena for both stages (gc runs to completion before dr starts): the gc arena is
-    /// stacked right past the dr input window, so gc's input/output survive the
-    /// stage-2 glue that writes the dr input, and dr then reuses everything above.
-    /// Returns the gc arena offset and the total size, in floats.
-    /// </summary>
-    internal static (long gcOff, long total) StackArenas(ExecPlan gc, ExecPlan dr, long align = 16) =>
-        StackArenas(gc.ArenaFloats, dr, dr.ArenaFloats, align);
-
-    /// <summary><see cref="StackArenas(ExecPlan, ExecPlan, long)"/> over each stage's full arena
-    /// (GPU graphs append scratch / tile-read slack past the plan's values).</summary>
-    internal static (long gcOff, long total) StackArenas(long gcArena, ExecPlan dr, long drArena, long align = 16)
-    {
-        CValue din = dr.Values[dr.InputValue];
-        long o = dr.BufOffset[din.Buf], end = (o + din.ElementCount + align - 1) / align * align;
-        long gcOff = o >= gcArena ? 0 : end;
-        return (gcOff, Math.Max(drArena, gcOff + gcArena));
+        catch { keep = false; throw; }
+        finally
+        {
+            if (keep) cpuPool.Return(session);
+            else session.Dispose();
+        }
     }
 
     // browser/WASI: unlinked P/Invokes (vulkan-1, libobjc) trap the wasm module with
     // "null function" instead of throwing, so every backend (Auto/Vulkan/Metal) resolves to CPU
     private static bool GpuPossible => !OperatingSystem.IsBrowser() && !OperatingSystem.IsWasi();
 
-    private static bool VulkanOk()
-    {
-        try { _ = VkBackend.Default.Dev.DeviceName; return true; }
-        catch { return false; }
-    }
+    private static bool VulkanOk() => VkBackend.TryGetDefault(out _);
 
     private static bool MetalOk()
     {
         try
         {
-            var dev = MetalBackend.Default.Dev;
-            // Apple7+ (M1+) for simdgroup matrix ops; Pipe() forces the embedded
-            // MSL library compile now rather than mid-Enhance on macOS 13. Intel Macs can
-            // claim Apple7 yet build the simdgroup-MMA conv with 0 threads/group (Pipe throws).
-            return dev.SupportsApple7 && dev.Pipe("bgr2nhwc", Backends.GcdrShaders.Owner) is not null && dev.Pipe("conv_mm_32_0") is not null;
+            // runs a tiny conv stack end to end: the MSL library compile happens now rather than
+            // mid-Enhance (macOS 13), and devices that cannot build the simdgroup-matrix convs (Intel
+            // Macs can claim Apple7 yet build them with 0 threads per group) fail here
+            if (!MetalBackend.TryGetDefault(out MetalBackend? mb)) return false;
+            using MtlImageSession s = mb.CreateImageSession(ProbeModel(), s_mtlImage);
+            byte[] img = new byte[32 * 32 * 3];
+            s.Run(img, 32, 32, 96, img, 96);
+            return true;
         }
         catch { return false; }
+    }
+
+    /// <summary>x -> 3x3 conv (3 to 32) -> relu -> 3x3 conv (32 to 3): the conv shapes the networks start with.</summary>
+    private static OnnxModel ProbeModel()
+    {
+        var b = new OnnxModelBuilder(18);
+        string x = b.Input("x", 1, 3, -1, -1);
+        string w1 = b.Constant("w1", new float[32 * 3 * 9], 32, 3, 3, 3), w2 = b.Constant("w2", new float[3 * 32 * 9], 3, 32, 3, 3);
+        string h = b.Node("Relu", [b.Node("Conv", [x, w1], null, ("pads", new[] { 1, 1, 1, 1 }))]);
+        b.Output(b.Node("Conv", [h, w2], null, ("pads", new[] { 1, 1, 1, 1 })));
+        return b.Build();
     }
 
     /// <summary>Convenience: enhance a tightly packed image in <paramref name="format"/>, returns a new array in the same format.</summary>
@@ -326,52 +348,7 @@ public sealed class GcdrEnhancer : IDisposable
         Interlocked.Exchange(ref _cpuPool, null)?.Dispose();
         Interlocked.Exchange(ref _vkPool, null)?.Dispose();
         Interlocked.Exchange(ref _mtlPool, null)?.Dispose();
-        _cpuPlans.Clear();
-    }
-
-    /// <summary>
-    /// Size-agnostic CPU worker: one native arena holding both stages (see
-    /// <see cref="StackArenas(ExecPlan, ExecPlan, long)"/>), borrowed by per-call sessions. Within
-    /// <see cref="CpuArenaBudget"/> it only grows (25% headroom on regrowth), so mixed sizes
-    /// neither reallocate nor re-fault pages; an over-budget arena (one huge image) drops
-    /// to exact size once a size that fits comes along.
-    /// </summary>
-    private sealed unsafe class CpuWorker : IDisposable
-    {
-        private nint _p;
-        private long _bytes;
-
-        public long Bytes => _bytes;
-
-        public nint Arena(long need)
-        {
-            need = Math.Max(need, 64);
-            bool shrink = _p != 0 && _bytes > CpuArenaBudget && need <= CpuArenaBudget;
-            if (_p != 0 && _bytes >= need && !shrink) return _p;
-            bool headroom = _p != 0 && !shrink && need / 4 * 5 <= CpuArenaBudget;
-            Release();
-            long cap = headroom ? need / 4 * 5 : need;
-            _p = (nint)NativeMemory.AllocZeroed((nuint)cap);
-            _bytes = cap;
-            GC.AddMemoryPressure(cap);
-            return _p;
-        }
-
-        private void Release()
-        {
-            if (_p == 0) return;
-            NativeMemory.Free((void*)_p);
-            GC.RemoveMemoryPressure(_bytes);
-            _p = 0; _bytes = 0;
-        }
-
-        public void Dispose()
-        {
-            Release();
-            GC.SuppressFinalize(this);
-        }
-
-        ~CpuWorker() => Release();
+        lock (_cpuSizes) _cpuSizes.Clear();
     }
 
     /// <summary>Bounded rent/return pool of stateful workers (at most <c>max</c> idle and,

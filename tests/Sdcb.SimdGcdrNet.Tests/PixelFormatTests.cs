@@ -1,7 +1,5 @@
 using Sdcb.SimdOnnx.Backends.Metal;
-using Sdcb.SimdGcdrNet.Backends.Metal;
 using Sdcb.SimdOnnx.Backends.Vulkan;
-using Sdcb.SimdGcdrNet.Backends.Vulkan;
 using Xunit;
 
 namespace Sdcb.SimdGcdrNet.Tests;

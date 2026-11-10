@@ -369,17 +369,7 @@ public static partial class Program
             }
             return 0;
         }
-        if (args.Length > 0 && args[0] == "--probe")
-        {
-            string pimg = args.Length > 1 ? args[1] : "18_shadow.webp";
-            return Probe(gcPath, drPath, Path.Combine(dir, "realdae", pimg), args.Skip(2).Select(int.Parse).ToArray());
-        }
-        if (args.Length > 0 && args[0] == "--bisect")
-        {
-            string pimg = args.Length > 1 ? args[1] : "18_shadow.webp";
-            return Bisect(gcPath, drPath, Path.Combine(dir, "realdae", pimg), args.Skip(2).Select(int.Parse).ToArray());
-        }
-        Console.WriteLine("usage: --ci smoke|bench [options] | --check [tag] | --bench [h] [w] [reps] | --node gc|dr h w idx reps [u] | --benchvk [h] [w] [reps] | --vkprof [h] [w] | --vkcheck [h] [w] | --vknodes gc|dr [h] [w] | --corpus [cpu|vulkan|auto] | --flip [img] | --analyze [h] [w] | --vkdup [h] [w] [dr] | --probe [img] [px...]");
+        Console.WriteLine("usage: --ci smoke|bench [options] | --check [tag] | --bench [h] [w] [reps] | --node gc|dr h w idx reps [u] | --benchvk [h] [w] [reps] | --vkprof [h] [w] | --vkcheck [h] [w] | --vknodes gc|dr [h] [w] | --corpus [cpu|vulkan|auto] | --flip [img] | --analyze [h] [w] | --vkdup [h] [w] [dr]");
         return 1;
     }
 
@@ -461,137 +451,6 @@ public static partial class Program
     // bisect nondeterminism: two same-size pipelines with churn pipelines created
     // between them; hash gc output + dr input + final dst per run to see which
     // stage first diverges.
-    private static int Probe(string gcPath, string drPath, string imgPath, int[] churnPx)
-    {
-        var be = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default;
-        var gc = OnnxModel.Load(gcPath); var dr = OnnxModel.Load(drPath);
-        int iw, ih; byte[] bgr;
-        (iw, ih) = ImageSize(imgPath);
-        bgr = DecodeBgr(imgPath);
-        byte[] dst = new byte[bgr.Length];
-        int pw = (iw + 31) / 32 * 32, ph = (ih + 31) / 32 * 32;
-        var gcI = new float[3 * pw * ph]; var gcO = new float[3 * pw * ph]; var drI = new float[6 * pw * ph];
-
-        static ulong Fb(byte[] d)
-        {
-            ulong h = 1469598103934665603UL;
-            for (int i = 0; i < d.Length; i += 977) { h ^= d[i]; h *= 1099511628211UL; }
-            return h;
-        }
-        static ulong Ff(float[] d)
-        {
-            ulong h = 1469598103934665603UL;
-            for (int i = 0; i < d.Length; i += 977) { h ^= BitConverter.SingleToUInt32Bits(d[i]); h *= 1099511628211UL; }
-            return h;
-        }
-        void Run(Backends.Vulkan.VkGcdrPipeline p, string tag)
-        {
-            p.Enhance(bgr, iw * 3, dst, iw * 3);
-            p.DebugIntermediates(gcI, gcO, drI);
-            Console.WriteLine($"{tag}: dst={Fb(dst):x16} gcIn={Ff(gcI):x16} gcOut={Ff(gcO):x16} drIn={Ff(drI):x16} live={Sdcb.SimdOnnx.Backends.Vulkan.VkDevice.LiveDeviceBytes >> 20}MB");
-        }
-
-        var p1 = NewVkPipe(be, gc, dr, ih, iw);
-        Run(p1, "p1-run1");
-        Run(p1, "p1-run2");
-        var churn = new List<Backends.Vulkan.VkGcdrPipeline>();
-        foreach (int px in churnPx)
-        {
-            int cw = Math.Max(64, (int)Math.Sqrt(px * 16.0 / 9) / 32 * 32);
-            int chh = Math.Max(64, px / Math.Max(cw, 1) / 32 * 32);
-            var cp = NewVkPipe(be, gc, dr, chh, cw);
-            byte[] cb = new byte[chh * cw * 3]; new Random(px).NextBytes(cb);
-            byte[] cd = new byte[chh * cw * 3];
-            cp.Enhance(cb, cw * 3, cd, cw * 3);
-            churn.Add(cp);
-            if (churn.Count > 1) { churn[0].Dispose(); churn.RemoveAt(0); }
-        }
-        foreach (var c in churn) c.Dispose();
-        var p2 = NewVkPipe(be, gc, dr, ih, iw);
-        Run(p2, "p2-after-churn");
-        p2.Dispose(); p1.Dispose();
-        return 0;
-    }
-
-    // bisect which plan value first diverges between two pipeline instances.
-    private static int Bisect(string gcPath, string drPath, string imgPath, int[] churnPx)
-    {
-        var be = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default;
-        var gc = OnnxModel.Load(gcPath); var dr = OnnxModel.Load(drPath);
-        int iw, ih;
-        (iw, ih) = ImageSize(imgPath);
-        byte[] bgr = DecodeBgr(imgPath);
-        byte[] dst = new byte[bgr.Length];
-
-        var p1 = NewVkPipe(be, gc, dr, ih, iw);
-        p1.Enhance(bgr, iw * 3, dst, iw * 3);
-        // replicate corpus allocation history: run every corpus image sorted by px
-        // (up to `churnPx[0]` predecessors, or all when empty) with real (h,w) sizes
-        var manifest = System.Text.Json.JsonDocument.Parse(
-            File.ReadAllText(Path.Combine(Path.GetDirectoryName(imgPath)!, "manifest.json")));
-        var seq = manifest.RootElement.GetProperty("images").EnumerateArray()
-            .Select(e => (name: e.GetProperty("name").GetString()!, w: e.GetProperty("w").GetInt32(), h: e.GetProperty("h").GetInt32()))
-            .Where(e => !(e.w == iw && e.h == ih))
-            .OrderBy(e => (long)e.w * e.h).ToArray();
-        int take = churnPx.Length > 0 ? churnPx[0] : seq.Length;
-        var alive = new List<Backends.Vulkan.VkGcdrPipeline>();
-        foreach (var e in seq.Take(take))
-        {
-            var cp = NewVkPipe(be, gc, dr, e.h, e.w);
-            byte[] cb = new byte[e.h * e.w * 3]; new Random(e.w * e.h).NextBytes(cb);
-            byte[] cd = new byte[e.h * e.w * 3];
-            cp.Enhance(cb, e.w * 3, cd, e.w * 3);
-            alive.Add(cp);
-            if (alive.Count > 1) { alive[0].Dispose(); alive.RemoveAt(0); }
-        }
-        foreach (var c in alive) c.Dispose();
-        var p2 = NewVkPipe(be, gc, dr, ih, iw);
-        p2.Enhance(bgr, iw * 3, dst, iw * 3);
-
-        // dump BOTH whole gc arenas in one shot each, diff per plan value on host
-        var plan = p1.DebugGc.DebugPlan;
-        Console.WriteLine($"gc plan: nodes={plan.Nodes.Length} values={plan.Values.Length} bufs={plan.BufOffset.Length} arena={plan.ArenaFloats}");
-        var a1 = new float[plan.ArenaFloats]; var a2 = new float[plan.ArenaFloats];
-        p1.DebugGc.DebugArena(a1);
-        p2.DebugGc.DebugArena(a2);
-        var map = new Dictionary<int, List<int>>(); // value -> producing node idx
-        for (int i = 0; i < plan.Nodes.Length; i++)
-            foreach (int o in plan.Nodes[i].Out) { if (!map.TryGetValue(o, out var l)) map[o] = l = []; l.Add(i); }
-        for (int vid = 0; vid < plan.Values.Length; vid++)
-        {
-            var v = plan.Values[vid];
-            if (v.Buf < 0 || v.Buf >= plan.BufOffset.Length || v.Shape.Length == 0) continue;
-            long s = plan.BufOffset[v.Buf], n = v.ElementCount;
-            if (s < 0) continue;
-            if (s + n > a1.Length) { Console.WriteLine($"  vid={vid} OVERFLOW buf={v.Buf} off={s} elems={n} arena={a1.Length}"); continue; }
-            int diff = 0; double maxd = 0;
-            for (long i = s; i < s + n; i += 97)
-                if (a1[i] != a2[i]) { diff++; maxd = Math.Max(maxd, Math.Abs((double)a1[i] - a2[i])); }
-            if (diff > 0)
-            {
-                string prod = map.TryGetValue(vid, out var l)
-                    ? string.Join(",", l.Select(i => $"[{i}]{plan.Nodes[i].Op}:{plan.Nodes[i].Name}"))
-                    : "input/none";
-                Console.WriteLine($"  vid={vid} buf={v.Buf} off={s} elems={n} shape=[{string.Join(',', v.Shape)}] ndiff={diff} maxd={maxd:G3}  prod={prod}");
-            }
-        }
-        // consts check: are the two graphs' weight buffers byte-identical?
-        var (c1, _) = p1.DebugGc.DebugBuffers;
-        var (c2, _) = p2.DebugGc.DebugBuffers;
-        unsafe
-        {
-            byte[] cb1 = new byte[c1.Size], cb2 = new byte[c2.Size];
-            fixed (byte* p = cb1) be.Dev.Download(c1, p, c1.Size);
-            fixed (byte* p = cb2) be.Dev.Download(c2, p, c2.Size);
-            long bdiff = 0, first = -1;
-            for (long i = 0; i < Math.Min(cb1.LongLength, cb2.LongLength); i++)
-                if (cb1[i] != cb2[i]) { bdiff++; if (first < 0) first = i; }
-            Console.WriteLine($"consts: handle={c1.Buffer == c2.Buffer} size={c1.Size}/{c2.Size} diffBytes={bdiff} first@{first}");
-        }
-        p1.Dispose(); p2.Dispose();
-        return 0;
-    }
-
     private static int Flip(string gcPath, string drPath, string corpusDir, string imgName)
     {
         var manifest = System.Text.Json.JsonDocument.Parse(
@@ -682,73 +541,6 @@ public static partial class Program
             Console.WriteLine($"{name + " (warmup)",-52} {w,5}x{h,-5} ws {ws,7:F1} MB");
         }
 
-        // GCDR_INTER=1: per-image intermediate hashes (gcIn/gcOut/drIn) to bisect
-        // which stage diverges between pipeline instances.
-        var inter = new Dictionary<string, (ulong gi, ulong go, ulong di)>();
-        string curName = ""; int curW = 0, curH = 0;
-        if (Environment.GetEnvironmentVariable("GCDR_INTER") == "1" && be != GcdrBackend.Cpu)
-        {
-            var ibuf = new float[12 * 2700 * 2700];
-            var savedArenas = new Dictionary<string, float[]>();
-            string? dumpDir = Environment.GetEnvironmentVariable("GCDR_DUMPPIPE");
-            static ulong Ff(Span<float> d)
-            {
-                ulong hh = 1469598103934665603UL;
-                for (int i = 0; i < d.Length; i += 977) { hh ^= BitConverter.SingleToUInt32Bits(d[i]); hh *= 1099511628211UL; }
-                return hh;
-            }
-            enh.DebugAfterEnhance = p =>
-            {
-                int pw = (curW + 31) / 32 * 32, ph = (curH + 31) / 32 * 32, hw = pw * ph;
-                var gi = ibuf.AsSpan(0, 3 * hw);
-                var go = ibuf.AsSpan(3 * hw, 3 * hw);
-                var di = ibuf.AsSpan(6 * hw, 6 * hw);
-                p.DebugIntermediates(gi, go, di);
-                int nz = 0; foreach (float f in go) if (f != 0) nz++;
-                var cur = (gi: Ff(gi), go: Ff(go), di: Ff(di));
-                bool hasPrev = inter.TryGetValue(curName, out var prev);
-                if (dumpDir != null)
-                {
-                    if (!savedArenas.ContainsKey(curName) && savedArenas.Count < 12 && hw < 2_000_000)
-                    {
-                        var saved = new float[p.DebugGc.DebugPlan.ArenaFloats];
-                        p.DebugGc.DebugArena(saved);
-                        savedArenas[curName] = saved;
-                    }
-                    else if (hasPrev && prev != cur && savedArenas.TryGetValue(curName, out var saved))
-                    {
-                        // rerun on a fresh pipe and diff arena values
-                        var a2 = new float[p.DebugGc.DebugPlan.ArenaFloats];
-                        p.DebugGc.DebugArena(a2);
-                        var plan = p.DebugGc.DebugPlan;
-                        var map = new Dictionary<int, List<int>>();
-                        for (int i = 0; i < plan.Nodes.Length; i++)
-                            foreach (int o in plan.Nodes[i].Out) { if (!map.TryGetValue(o, out var l)) map[o] = l = []; l.Add(i); }
-                        for (int vid = 0; vid < plan.Values.Length; vid++)
-                        {
-                            var v = plan.Values[vid];
-                            if (v.Buf < 0 || v.Buf >= plan.BufOffset.Length || v.Shape.Length == 0) continue;
-                            long s = plan.BufOffset[v.Buf], n = v.ElementCount;
-                            if (s < 0 || s + n > a2.LongLength) continue;
-                            int nd = 0;
-                            for (long i = s; i < s + n; i += 97) if (saved[i] != a2[i]) nd++;
-                            if (nd > 0)
-                            {
-                                string prod = map.TryGetValue(vid, out var l)
-                                    ? string.Join(",", l.Select(i => $"[{i}]{plan.Nodes[i].Op}:{plan.Nodes[i].Name}")) : "in";
-                                Console.WriteLine($"    vid={vid} buf={v.Buf} off={s} shape=[{string.Join(',', v.Shape)}] nd={nd} prod={prod}");
-                            }
-                        }
-                    }
-                }
-                if (!hasPrev) inter[curName] = cur;
-                else if (prev != cur)
-                    Console.WriteLine($"  INTER DIFF {curName}: gcIn {(prev.gi == cur.gi ? "same" : $"{prev.gi:x8}->{cur.gi:x8}")} " +
-                        $"gcOut {(prev.go == cur.go ? "same" : $"{prev.go:x8}->{cur.go:x8}")} " +
-                        $"drIn {(prev.di == cur.di ? "same" : $"{prev.di:x8}->{cur.di:x8}")} nz={nz}/{go.Length} first={go[0]:G4},{go[1]:G4},{go[2]:G4},{go[3]:G4}");
-            };
-        }
-
         Sdcb.SimdOnnx.Backends.Vulkan.VkDevice.ResetPeakDeviceBytes();
         long gc0 = GC.GetTotalMemory(true);
         double wsLast = wsLoaded;
@@ -764,7 +556,6 @@ public static partial class Program
         {
             int len = DecodeBgr(Path.Combine(corpusDir, name), ref srcBuf);
             Span<byte> bgr = srcBuf.AsSpan(0, len), dst = Grow(ref dstBuf, len);
-            curName = name; curW = w; curH = h;
             long t = Stopwatch.GetTimestamp();
             enh.Enhance(bgr, w, h, w * 3, dst, w * 3);
             double ms = (Stopwatch.GetTimestamp() - t) * 1000.0 / Stopwatch.Frequency;
@@ -803,7 +594,6 @@ public static partial class Program
         {
             int len = DecodeBgr(Path.Combine(corpusDir, name), ref srcBuf);
             Span<byte> bgr = srcBuf.AsSpan(0, len), dst = Grow(ref dstBuf, len);
-            curName = name; curW = w; curH = h;
             long t = Stopwatch.GetTimestamp();
             enh.Enhance(bgr, w, h, w * 3, dst, w * 3);
             warmMs += (Stopwatch.GetTimestamp() - t) * 1000.0 / Stopwatch.Frequency;
@@ -1077,12 +867,5 @@ public static partial class Program
             d = d.Parent;
         }
         throw new DirectoryNotFoundException("testdata not found");
-    }
-
-    private static Backends.Vulkan.VkGcdrPipeline NewVkPipe(Sdcb.SimdOnnx.Backends.Vulkan.VkBackend be, OnnxModel gc, OnnxModel dr, int ih, int iw)
-    {
-        var p = new Backends.Vulkan.VkGcdrPipeline(be, gc, dr);
-        try { p.Bind(ih, iw); return p; }
-        catch { p.Dispose(); throw; }
     }
 }
