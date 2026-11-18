@@ -9,8 +9,10 @@
 **Sdcb.SimdGcdrNet** is a pure C# implementation of [GCDRNet](https://github.com/ZZZHANG-jx/GCDRNet)
 (*Appearance Enhancement for Camera-captured Document Images in the Wild*, IEEE TAI 2023) —
 document-image shadow removal and appearance enhancement **without onnxruntime or any other
-third-party inference engine**. Inference runs on [Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx),
-a pure C# engine shared with `Sdcb.SimdPaddleOCR` (it grew out of this repository's own engine).
+third-party inference engine**. Inference runs on [SimdOnnx](https://github.com/sdcb/SimdOnnx),
+a pure C# engine shared with `Sdcb.SimdPaddleOCR` (it grew out of this repository's own engine). Its
+source (a git submodule) compiles into this library with every engine type internal, so there is no
+separate engine package.
 
 The model is a two-stage pipeline:
 
@@ -111,13 +113,13 @@ dotnet run --project examples/PaddleOCR.Console -- [image] [output.jpg]
 ### Layout
 
 The ONNX engine (protobuf reader, graph compiler, CPU SIMD kernels, Vulkan / Metal backends) is
-[Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx); this library holds the GCDRNet-specific parts:
+[SimdOnnx](https://github.com/sdcb/SimdOnnx), checked out as the `external/SimdOnnx` submodule (clone with
+`--recursive`, or run `git submodule update --init`); this library holds the GCDRNet-specific parts:
 
 - `src/Sdcb.SimdGcdrNet/GcdrEnhancer.cs` — public API: backend selection, session pools, and the
   composed model (GC-Net → `clamp(x / max(shading, 1e-6), 0, 1)` → DR-Net, built with
   `OnnxModelBuilder`) that runs on SimdOnnx's `CpuSession` and `VkImageSession` / `MtlImageSession`.
-  The library uses only SimdOnnx's public API; the fusions it needs (UpHead, ChannelShift, SafeDiv)
-  are engine built-ins.
+  The fusions it needs (UpHead, ChannelShift, SafeDiv) are engine built-ins.
 - `bench/Sdcb.SimdGcdrNet.Benchmark` — `--check`, `--bench` (CPU), `--benchvk` (Vulkan e2e),
   `--benchmtl` / `--checkgpu` / `--mtlprof` / `--mtrace` (Metal e2e, diff check, per-shader
   profile, CPU-vs-Metal per-node trace), `--vkprof` (per-shader/per-dispatch GPU timing), `--vkcheck` / `--vknodes`
@@ -170,8 +172,8 @@ runs two waves in parallel, then merges them into one report (the run's summary 
   `GcdrBackend.Metal` selects it unconditionally. Set `GCDRNET_MTL_VERBOSE=1` to print the chosen device.
 - Thread-safety: `GcdrEnhancer` is thread-safe (CPU: per-size session pools; Vulkan: size-agnostic worker pool).
 - 2.0 moved the engine out: `InferenceSession`, `CompiledModel`, `OnnxModel`, `VkInferenceSession` and
-  `MtlInferenceSession` are no longer in `Sdcb.SimdGcdrNet.*`; use the same types from
-  `Sdcb.SimdOnnx.*` (a dependency of this package). `GcdrEnhancer`'s API is unchanged.
+  `MtlInferenceSession` are no longer public (the engine is compiled in as internal types).
+  `GcdrEnhancer`'s API is unchanged.
 - Not covered: batched inference (N>1), fp16/int8.
 - Native AOT works (`IsAotCompatible`, no trim/AOT warnings; CPU and Vulkan output verified identical to JIT). On **x64** the executable
   project must set the instruction set, otherwise ILC compiles for the SSE baseline, folds
@@ -200,7 +202,8 @@ are from the RealDAE dataset of the same paper.
 
 **Sdcb.SimdGcdrNet** 是 [GCDRNet](https://github.com/ZZZHANG-jx/GCDRNet)（相机拍摄文档去阴影/外观增强，
 IEEE TAI 2023）的**纯 C# 推理库**——不依赖 onnxruntime 等第三方推理引擎，与 `Sdcb.SimdPaddleOCR`
-共用纯 C# 推理引擎 [Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx)（2.0 起引擎类型移到 `Sdcb.SimdOnnx.*`）。
+共用纯 C# 推理引擎 [SimdOnnx](https://github.com/sdcb/SimdOnnx)。引擎以源码形式（git submodule）编译进本库，
+类型全部 internal，不额外引入引擎包（2.0 起引擎类型不再公开）。
 
 模型为两级串联：**GC-Net** 估计逐像素光照/阴影图 `I_sm` → `I_GC = clamp(I_s/I_sm)` 除法校正 →
 **DR-Net** 消费 6 通道 `[I_s; I_GC]` 输出增强图。
@@ -291,7 +294,7 @@ dotnet run --project examples/PaddleOCR.Console -- [图片] [输出.jpg]
 ### 构建 shader
 
 本库不再自带 shader：所有 GPU 内核（包括 UpHead / ChannelShift 融合和像素 I/O）都在
-[Sdcb.SimdOnnx](https://github.com/sdcb/SimdOnnx) 里。
+[SimdOnnx](https://github.com/sdcb/SimdOnnx)（`external/SimdOnnx` submodule）里。
 
 ### 测试
 

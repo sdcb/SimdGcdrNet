@@ -8,10 +8,6 @@
     <!-- LINQPad picks these up from packages tagged linqpad-samples -->
     <None Include="linqpad-samples\*.linq" Pack="true" PackagePath="linqpad-samples" />
   </ItemGroup>
-  <ItemGroup Condition="'$(UseLocalSimdOnnx)' == 'true'">
-    <ProjectReference Include="$(SimdOnnxProject)" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseLocalSimdOnnx)' != 'true'">
-    <PackageReference Include="Sdcb.SimdOnnx" Version="[$(SdcbSimdOnnxVersion)]" />
-  </ItemGroup>
+  <!-- the engine, compiled in as internal types -->
+  <Import Project="$(SimdOnnxRoot)src\Sdcb.SimdOnnx\Sdcb.SimdOnnx.Sources.props" />
 </Project>
